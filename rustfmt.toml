@@ -1,0 +1,6 @@
+# Keep project code aligned with the repository-wide indentation convention.
+hard_tabs = true
+edition = "2024"
+use_field_init_shorthand = true
+use_try_shorthand = true
+

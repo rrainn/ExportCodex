@@ -1,0 +1,70 @@
+# This formula is generated from immutable release artifacts.
+# Edit the source template in ExportCodex instead of the rendered tap copy.
+class ExportCodex < Formula
+  desc "Export Codex chats to Markdown, HTML, and searchable PDF"
+  homepage "https://github.com/rrainn/ExportCodex"
+  version "{{VERSION}}"
+  license "MIT"
+
+  on_macos do
+    if Hardware::CPU.arm?
+      url "{{DARWIN_ARM64_URL}}"
+      sha256 "{{DARWIN_ARM64_SHA256}}"
+    else
+      url "{{DARWIN_X64_URL}}"
+      sha256 "{{DARWIN_X64_SHA256}}"
+    end
+  end
+
+  on_linux do
+    if Hardware::CPU.arm?
+      url "{{LINUX_ARM64_URL}}"
+      sha256 "{{LINUX_ARM64_SHA256}}"
+    else
+      url "{{LINUX_X64_URL}}"
+      sha256 "{{LINUX_X64_SHA256}}"
+    end
+  end
+
+  def install
+    # Release archives have one top-level directory that Homebrew removes.
+    bin.install "export-codex"
+  end
+
+  test do
+    assert_match version.to_s, shell_output("#{bin}/export-codex --version")
+    assert_match "Usage", shell_output("#{bin}/export-codex --help")
+
+    # A filesystem-only rollout proves the installed binary can complete its core path.
+    thread_id = "019f874c-1e53-7d12-97db-fac3249ce327"
+    codex_home = testpath/"codex-home"
+    sessions = codex_home/"sessions/2026/07/20"
+    sessions.mkpath
+    rollout = sessions/"rollout-2026-07-20T10-00-00-#{thread_id}.jsonl"
+    rollout.write <<~JSONL
+      {"timestamp":"2026-07-20T10:00:00Z","type":"session_meta","payload":{"id":"#{thread_id}","cwd":"/workspace","source":"cli"}}
+      {"timestamp":"2026-07-20T10:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Homebrew visible user prompt"}}
+      {"timestamp":"2026-07-20T10:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"Homebrew visible agent response","phase":"final_answer"}}
+    JSONL
+
+    transcript = testpath/"transcript.md"
+    system bin/"export-codex",
+           "--codex-home", codex_home.to_s,
+           thread_id,
+           "--format", "markdown",
+           "--output", transcript.to_s
+    assert transcript.exist?, "Markdown export was not created"
+    transcript_text = transcript.read
+    assert_match "Homebrew visible user prompt", transcript_text
+    assert_match "Homebrew visible agent response", transcript_text
+
+    # The default path must exercise the packaged pure-Rust PDF renderer too.
+    pdf = testpath/"transcript.pdf"
+    system bin/"export-codex",
+           "--codex-home", codex_home.to_s,
+           thread_id,
+           "--output", pdf.to_s
+    assert pdf.exist?, "Default PDF export was not created"
+    assert_equal "%PDF-", pdf.binread(5)
+  end
+end

@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+# Validation never needs to mutate repository state.
+permissions:
+  contents: read
+
+# A newer commit makes an older validation run irrelevant for the same ref.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    name: Quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6.0.2
+
+      - name: Activate pinned Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: quality
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint all targets
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Build API documentation
+        env:
+          # Documentation warnings often expose broken public API references.
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --all-features --no-deps --locked
+
+      - name: Test Homebrew formula renderer
+        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+
+      - name: Validate example Homebrew formula
+        run: |
+          python3 scripts/render_homebrew_formula.py \
+            --version 0.0.0 \
+            --tag v0.0.0 \
+            --darwin-arm64-sha256 0000000000000000000000000000000000000000000000000000000000000000 \
+            --darwin-x64-sha256 1111111111111111111111111111111111111111111111111111111111111111 \
+            --linux-arm64-sha256 2222222222222222222222222222222222222222222222222222222222222222 \
+            --linux-x64-sha256 3333333333333333333333333333333333333333333333333333333333333333 \
+            --output "$RUNNER_TEMP/export-codex.rb"
+          ruby -c "$RUNNER_TEMP/export-codex.rb"
+
+  test:
+    name: Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    strategy:
+      # Platform-specific failures should not hide results from other platforms.
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6.0.2
+
+      - name: Activate pinned Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: tests
+
+      - name: Run test suite
+        run: cargo test --workspace --all-features --locked
+
+      - name: Smoke-test CLI help
+        run: cargo run --locked -- --help
+
+      - name: Smoke-test CLI version
+        run: cargo run --locked -- --version
+
+  ci:
+    name: CI
+    if: always()
+    needs:
+      - quality
+      - test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Confirm required jobs succeeded
+        env:
+          QUALITY_RESULT: ${{ needs.quality.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+        run: |
+          if [[ "$QUALITY_RESULT" != "success" || "$TEST_RESULT" != "success" ]]; then
+            echo "Required CI job failed or was canceled."
+            exit 1
+          fi
+          echo "All required CI jobs passed."
+

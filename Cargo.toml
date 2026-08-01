@@ -1,0 +1,53 @@
+[package]
+name = "export-codex"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Export local Codex chats to polished Markdown, HTML, and PDF documents"
+license = "MIT"
+repository = "https://github.com/rrainn/ExportCodex"
+homepage = "https://github.com/rrainn/ExportCodex"
+readme = "README.md"
+keywords = ["codex", "chat", "export", "markdown", "pdf"]
+categories = ["command-line-utilities", "text-processing"]
+
+[[bin]]
+name = "export-codex"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.6", features = ["derive", "env"] }
+crossterm = "0.29"
+dirs = "6.0"
+markdown2pdf = { version = "1.6", default-features = false }
+pulldown-cmark = "0.13"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29", "layout-cache"] }
+rusqlite = { version = "0.38", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tempfile = "3.27"
+thiserror = "2.0"
+toml = "1.0"
+url = "2.5"
+uuid = { version = "1.18", features = ["serde"] }
+walkdir = "2.5"
+zstd = "0.13"
+
+[dev-dependencies]
+assert_cmd = "2.0"
+lopdf = { version = "0.44", default-features = false }
+predicates = "3.1"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = true
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+all = "warn"

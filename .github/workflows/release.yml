@@ -1,0 +1,504 @@
+name: Release
+
+on:
+  push:
+    tags:
+      # Metadata validation below enforces the exact semantic-version shape.
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing v-prefixed tag to publish or repair
+        required: true
+        type: string
+
+# Jobs opt into write access only where publishing requires it.
+permissions:
+  contents: read
+
+# Serial releases keep formula updates ordered even when two tags arrive together.
+concurrency:
+  group: export-codex-release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+jobs:
+  metadata:
+    name: Validate release metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      prerelease: ${{ steps.release.outputs.prerelease }}
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v6.0.2
+        with:
+          fetch-depth: 0
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Validate tag, version, and ancestry
+        id: release
+        shell: bash
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+            echo "Release tag must be v-prefixed semantic versioning without build metadata."
+            exit 1
+          fi
+          if ! git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            echo "$RELEASE_TAG must be an existing Git tag, not a similarly named branch."
+            exit 1
+          fi
+
+          VERSION="${RELEASE_TAG#v}"
+          PACKAGE_VERSION="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
+          if [[ "$VERSION" != "$PACKAGE_VERSION" ]]; then
+            echo "Tag version $VERSION does not match Cargo.toml version $PACKAGE_VERSION."
+            exit 1
+          fi
+
+          TAG_COMMIT="$(git rev-list -n 1 "$RELEASE_TAG")"
+          if ! git merge-base --is-ancestor "$TAG_COMMIT" origin/main; then
+            echo "Release tag must point to a commit contained in origin/main."
+            exit 1
+          fi
+
+          PRERELEASE=false
+          if [[ "$VERSION" == *-* ]]; then
+            PRERELEASE=true
+          fi
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  verify:
+    name: Verify release source
+    needs: metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ needs.metadata.outputs.tag }}
+
+      - name: Activate pinned Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-verification
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint all targets
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Run test suite
+        run: cargo test --workspace --all-features --locked
+
+      - name: Test formula renderer
+        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs:
+      - metadata
+      - verify
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      # Collect every target result so one failure does not hide another.
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+          - runner: macos-26-intel
+            target: x86_64-apple-darwin
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ needs.metadata.outputs.tag }}
+
+      - name: Install musl linker
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+
+      - name: Install release target
+        run: rustup target add "${{ matrix.target }}"
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build optimized binary
+        env:
+          # A deliberate deployment floor prevents accidental dependence on a new SDK.
+          MACOSX_DEPLOYMENT_TARGET: "12.0"
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+
+      - name: Verify native binary starts
+        run: target/${{ matrix.target }}/release/export-codex --version
+
+      - name: Upload unmodified binary
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: binary-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/export-codex
+          if-no-files-found: error
+          retention-days: 7
+
+  package:
+    name: Package deterministic release assets
+    needs:
+      - metadata
+      - build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v6.0.2
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.metadata.outputs.tag }}
+
+      - name: Download platform binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: binaries
+
+      - name: Build reproducible archives and checksum manifest
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          mkdir -p release-assets staging
+          : > release-assets/SHA256SUMS.unsorted
+
+          TARGETS=(
+            aarch64-apple-darwin
+            x86_64-apple-darwin
+            aarch64-unknown-linux-musl
+            x86_64-unknown-linux-musl
+          )
+
+          for TARGET in "${TARGETS[@]}"; do
+            SOURCE="binaries/binary-${TARGET}/export-codex"
+            test -f "$SOURCE"
+
+            ARCHIVE_ROOT="export-codex-v${VERSION}-${TARGET}"
+            STAGE_DIRECTORY="staging/${ARCHIVE_ROOT}"
+            mkdir -p "$STAGE_DIRECTORY"
+            install -m 0755 "$SOURCE" "$STAGE_DIRECTORY/export-codex"
+            install -m 0644 LICENSE README.md "$STAGE_DIRECTORY/"
+
+            ARCHIVE="release-assets/${ARCHIVE_ROOT}.tar.gz"
+            # GNU tar plus gzip -n removes host, owner, ordering, and timestamp variance.
+            tar \
+              --sort=name \
+              --mtime="@${SOURCE_DATE_EPOCH}" \
+              --owner=0 \
+              --group=0 \
+              --numeric-owner \
+              --format=posix \
+              --pax-option=delete=atime,delete=ctime \
+              -C staging \
+              -cf - \
+              "$ARCHIVE_ROOT" | gzip -n -9 > "$ARCHIVE"
+
+            CHECKSUM="$(sha256sum "$ARCHIVE" | awk '{print $1}')"
+            printf '%s  %s\n' "$CHECKSUM" "${ARCHIVE_ROOT}.tar.gz" >> release-assets/SHA256SUMS.unsorted
+          done
+
+          LC_ALL=C sort -k2 release-assets/SHA256SUMS.unsorted > release-assets/SHA256SUMS
+          rm release-assets/SHA256SUMS.unsorted
+          # Verify from the manifest directory because it intentionally stores portable filenames.
+          (cd release-assets && sha256sum --check SHA256SUMS)
+
+      - name: Render public Homebrew formula
+        env:
+          TAG: ${{ needs.metadata.outputs.tag }}
+          VERSION: ${{ needs.metadata.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          checksum_for() {
+            awk -v filename="$1" '$2 == filename { print $1 }' release-assets/SHA256SUMS
+          }
+
+          python3 scripts/render_homebrew_formula.py \
+            --version "$VERSION" \
+            --tag "$TAG" \
+            --darwin-arm64-sha256 "$(checksum_for "export-codex-v${VERSION}-aarch64-apple-darwin.tar.gz")" \
+            --darwin-x64-sha256 "$(checksum_for "export-codex-v${VERSION}-x86_64-apple-darwin.tar.gz")" \
+            --linux-arm64-sha256 "$(checksum_for "export-codex-v${VERSION}-aarch64-unknown-linux-musl.tar.gz")" \
+            --linux-x64-sha256 "$(checksum_for "export-codex-v${VERSION}-x86_64-unknown-linux-musl.tar.gz")" \
+            --output release-assets/Formula/export-codex.rb
+          ruby -c release-assets/Formula/export-codex.rb
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: release-assets
+          path: release-assets/
+          if-no-files-found: error
+          retention-days: 14
+
+  homebrew-preflight:
+    name: Homebrew preflight (${{ matrix.target }})
+    needs:
+      - metadata
+      - package
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      # Exercise every branch in the four-platform formula before publication.
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+          - runner: macos-26-intel
+            target: x86_64-apple-darwin
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      HOMEBREW_NO_ENV_HINTS: 1
+      # Hosted Linux runners cannot use Homebrew's rootless Bubblewrap sandbox.
+      HOMEBREW_NO_SANDBOX_LINUX: 1
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ needs.metadata.outputs.tag }}
+
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: release-assets
+
+      - name: Install Homebrew on Linux
+        if: runner.os == 'Linux'
+        env:
+          NONINTERACTIVE: 1
+        run: |
+          /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+          echo "/home/linuxbrew/.linuxbrew/bin" >> "$GITHUB_PATH"
+          echo "/home/linuxbrew/.linuxbrew/sbin" >> "$GITHUB_PATH"
+
+      - name: Render formula with local archive URLs
+        env:
+          TAG: ${{ needs.metadata.outputs.tag }}
+          VERSION: ${{ needs.metadata.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          checksum_for() {
+            awk -v filename="$1" '$2 == filename { print $1 }' release-assets/SHA256SUMS
+          }
+
+          ASSET_PREFIX="file://${PWD}/release-assets"
+          python3 scripts/render_homebrew_formula.py \
+            --version "$VERSION" \
+            --tag "$TAG" \
+            --asset-url-prefix "$ASSET_PREFIX" \
+            --darwin-arm64-sha256 "$(checksum_for "export-codex-v${VERSION}-aarch64-apple-darwin.tar.gz")" \
+            --darwin-x64-sha256 "$(checksum_for "export-codex-v${VERSION}-x86_64-apple-darwin.tar.gz")" \
+            --linux-arm64-sha256 "$(checksum_for "export-codex-v${VERSION}-aarch64-unknown-linux-musl.tar.gz")" \
+            --linux-x64-sha256 "$(checksum_for "export-codex-v${VERSION}-x86_64-unknown-linux-musl.tar.gz")" \
+            --output "$RUNNER_TEMP/export-codex.rb"
+          ruby -c "$RUNNER_TEMP/export-codex.rb"
+
+      - name: Create local test tap
+        shell: bash
+        run: |
+          git config --global user.name "ExportCodex CI"
+          git config --global user.email "ci@export-codex.invalid"
+          brew tap-new export-codex/preflight
+          cp "$RUNNER_TEMP/export-codex.rb" "$(brew --repo export-codex/preflight)/Formula/export-codex.rb"
+
+      - name: Install and test local formula
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
+        shell: bash
+        run: |
+          brew install export-codex/preflight/export-codex
+          export-codex --version | grep -F "$VERSION"
+          export-codex --help | grep -F "Usage"
+          brew test export-codex/preflight/export-codex
+
+  publish-release:
+    name: Publish GitHub Release
+    needs:
+      - metadata
+      - package
+      - homebrew-preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    outputs:
+      url: ${{ steps.publish.outputs.url }}
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: release-assets
+
+      - name: Create or repair GitHub Release
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRERELEASE: ${{ needs.metadata.outputs.prerelease }}
+          TAG: ${{ needs.metadata.outputs.tag }}
+          VERSION: ${{ needs.metadata.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t ARCHIVES < <(find release-assets -maxdepth 1 -type f -name '*.tar.gz' -print | LC_ALL=C sort)
+          if [[ "${#ARCHIVES[@]}" -ne 4 ]]; then
+            echo "Expected four release archives, found ${#ARCHIVES[@]}."
+            exit 1
+          fi
+          ASSETS=("${ARCHIVES[@]}" release-assets/SHA256SUMS)
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # Reruns repair missing or partial assets without replacing the tag.
+            gh release upload "$TAG" "${ASSETS[@]}" --clobber
+          else
+            RELEASE_ARGUMENTS=(
+              "$TAG"
+              "${ASSETS[@]}"
+              --verify-tag
+              --generate-notes
+              --title "ExportCodex ${VERSION}"
+            )
+            if [[ "$PRERELEASE" == "true" ]]; then
+              RELEASE_ARGUMENTS+=(--prerelease)
+            fi
+            gh release create "${RELEASE_ARGUMENTS[@]}"
+          fi
+
+          RELEASE_URL="$(gh release view "$TAG" --json url --jq .url)"
+          echo "url=$RELEASE_URL" >> "$GITHUB_OUTPUT"
+          echo "Published $RELEASE_URL"
+
+  update-homebrew:
+    name: Update Homebrew tap
+    needs:
+      - metadata
+      - package
+      - publish-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release
+    steps:
+      - name: Download rendered formula
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: release-assets
+
+      - name: Publish formula with optimistic concurrency
+        env:
+          # Scope this fine-grained token to Contents read/write on the tap only.
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_PAT }}
+          VERSION: ${{ needs.metadata.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          FORMULA="release-assets/Formula/export-codex.rb"
+          API_PATH="repos/rrainn/homebrew-tap/contents/Formula/export-codex.rb"
+          ENCODED_CONTENT="$(base64 < "$FORMULA" | tr -d '\n')"
+
+          EXISTING_SHA=""
+          EXISTING_CONTENT=""
+          if METADATA="$(gh api "$API_PATH" 2>/dev/null)"; then
+            EXISTING_SHA="$(jq -r .sha <<< "$METADATA")"
+            EXISTING_CONTENT="$(jq -r .content <<< "$METADATA" | tr -d '\n')"
+          fi
+
+          if [[ "$EXISTING_CONTENT" == "$ENCODED_CONTENT" ]]; then
+            echo "Tap formula already contains ExportCodex $VERSION."
+            exit 0
+          fi
+
+          API_ARGUMENTS=(
+            --method PUT
+            "$API_PATH"
+            -f "branch=main"
+            -f "message=Publish export-codex ${VERSION}"
+            -f "content=${ENCODED_CONTENT}"
+          )
+          if [[ -n "$EXISTING_SHA" ]]; then
+            API_ARGUMENTS+=(-f "sha=${EXISTING_SHA}")
+          fi
+          gh api "${API_ARGUMENTS[@]}" --jq '.commit.html_url'
+
+  homebrew-smoke:
+    name: Published Homebrew smoke (${{ matrix.os }})
+    needs:
+      - metadata
+      - update-homebrew
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    environment: release
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-latest
+          - ubuntu-latest
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      HOMEBREW_NO_ENV_HINTS: 1
+      HOMEBREW_NO_SANDBOX_LINUX: 1
+    steps:
+      - name: Install Homebrew on Linux
+        if: runner.os == 'Linux'
+        env:
+          NONINTERACTIVE: 1
+        run: |
+          /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+          echo "/home/linuxbrew/.linuxbrew/bin" >> "$GITHUB_PATH"
+          echo "/home/linuxbrew/.linuxbrew/sbin" >> "$GITHUB_PATH"
+
+      - name: Tap authenticated repository
+        env:
+          # Authentication remains necessary until rrainn/homebrew-tap is public.
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_PAT }}
+        shell: bash
+        run: brew tap rrainn/tap "https://x-access-token:${TAP_TOKEN}@github.com/rrainn/homebrew-tap.git"
+
+      - name: Install and test published formula
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
+        shell: bash
+        run: |
+          brew install rrainn/tap/export-codex
+          export-codex --version | grep -F "$VERSION"
+          export-codex --help | grep -F "Usage"
+          brew test rrainn/tap/export-codex

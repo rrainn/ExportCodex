@@ -1,0 +1,7 @@
+{"timestamp":"2026-07-20T10:00:00Z","type":"session_meta","payload":{"id":"0198cabe-0dc5-7c82-a9a9-99740a332c0b","timestamp":"2026-07-20T10:00:00Z","cwd":"/Users/example/ExportCodex","source":"cli","model":"gpt-5"}}
+{"timestamp":"2026-07-20T10:00:01Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"DO_NOT_EXPORT_HIDDEN_CONTEXT"}]}}
+{"timestamp":"2026-07-20T10:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"Please export **this chat**. <script>not executable</script>"}}
+{"timestamp":"2026-07-20T10:00:03Z","type":"event_msg","payload":{"type":"agent_message","message":"I’m checking the archive and layout.","phase":"commentary"}}
+{"timestamp":"2026-07-20T10:00:04Z","type":"response_item","payload":{"type":"function_call_output","output":"DO_NOT_EXPORT_TOOL_OUTPUT"}}
+{"timestamp":"2026-07-20T10:00:05Z","type":"event_msg","payload":{"type":"agent_message","message":"The export is ready.\n\n```rust\nfn main() {\n\tprintln!(\"selectable café → text\");\n}\n```\n\n| Format | Ready |\n| --- | --- |\n| PDF | Yes |","phase":"final_answer"}}
+{"timestamp":"2026-07-20T10:00:06Z","type":"event_msg","payload":{"type":"task_complete","last_agent_message":"DO_NOT_EXPORT_DUPLICATE"}}
