@@ -14,6 +14,7 @@ use rusqlite::{Connection, OpenFlags, Row};
 use walkdir::WalkDir;
 
 use super::jsonl::{SessionMetadata, SnapshotRecord, sanitize_text, visit_snapshot_records};
+use super::rollout::{is_rollout_file, rollout_ids_from_filename};
 use super::selector::ThreadSelector;
 use crate::domain::{MessageRole, ThreadId, ThreadSummary};
 
@@ -153,7 +154,7 @@ impl Catalog {
 					bail!("unsupported Codex rollout format: {}", path.display());
 				}
 
-				let filename_id = thread_id_from_filename(&path);
+				let filename_id = rollout_ids_from_filename(&path).map(|ids| ids.session);
 				let (summary, _) = summarize_rollout(&self.home, &path, filename_id)?;
 				Ok(summary)
 			}
@@ -424,7 +425,7 @@ fn discover_rollouts(home: &Path) -> (Vec<RolloutLocation>, Vec<String>) {
 			if !entry.file_type().is_file() || !is_rollout_file(entry.path()) {
 				continue;
 			}
-			let Some(id) = thread_id_from_filename(entry.path()) else {
+			let Some(id) = rollout_ids_from_filename(entry.path()).map(|ids| ids.session) else {
 				continue;
 			};
 			let modified = entry
@@ -487,9 +488,14 @@ fn reconcile_threads(
 			known.insert(thread.id);
 			threads.push(thread);
 		} else {
+			let expected = if thread.rollout_path.as_os_str().is_empty() {
+				"no recorded path".to_owned()
+			} else {
+				thread.rollout_path.display().to_string()
+			};
 			warnings.push(format!(
-				"Skipped session {} because its rollout file is missing.",
-				thread.id
+				"Catalog session {} points to a missing rollout ({expected}); the unavailable task was omitted.",
+				thread.id,
 			));
 		}
 	}
@@ -539,8 +545,10 @@ fn summarize_rollout(
 	let mut first_user_message = None;
 	let warnings = visit_snapshot_records(path, |record| {
 		match record {
-			SnapshotRecord::Session(session) if metadata.is_none() => metadata = Some(session),
-			SnapshotRecord::Message(message)
+			SnapshotRecord::Session {
+				metadata: session, ..
+			} if metadata.is_none() => metadata = Some(session),
+			SnapshotRecord::Message { message, .. }
 				if message.role == MessageRole::User && first_user_message.is_none() =>
 			{
 				first_user_message = Some(message.text);
@@ -630,40 +638,6 @@ fn resolve_direct_path(home: &Path, path: &Path) -> PathBuf {
 
 fn is_archived_path(home: &Path, path: &Path) -> bool {
 	path.strip_prefix(home.join("archived_sessions")).is_ok()
-}
-
-fn is_rollout_file(path: &Path) -> bool {
-	has_extension(path, "jsonl")
-		|| (has_extension(path, "zst")
-			&& path
-				.file_stem()
-				.map(Path::new)
-				.is_some_and(|stem| has_extension(stem, "jsonl")))
-}
-
-fn has_extension(path: &Path, expected: &str) -> bool {
-	path.extension()
-		.and_then(|extension| extension.to_str())
-		.is_some_and(|extension| extension.eq_ignore_ascii_case(expected))
-}
-
-fn thread_id_from_filename(path: &Path) -> Option<ThreadId> {
-	let name = path.file_name()?.to_str()?;
-	let suffix_length = if has_extension(path, "jsonl") {
-		".jsonl".len()
-	} else if has_extension(path, "zst")
-		&& path
-			.file_stem()
-			.map(Path::new)
-			.is_some_and(|stem| has_extension(stem, "jsonl"))
-	{
-		".jsonl.zst".len()
-	} else {
-		return None;
-	};
-	let stem = name.get(..name.len().checked_sub(suffix_length)?)?;
-	let id = stem.get(stem.len().checked_sub(36)?..)?;
-	id.parse().ok()
 }
 
 #[cfg(test)]
@@ -766,6 +740,105 @@ mod tests {
 		assert_eq!(default_threads.len(), 1);
 		assert_eq!(default_threads[0].title, "Recovered from disk");
 		assert_eq!(with_agents.len(), 2);
+	}
+
+	#[test]
+	fn compound_archive_filename_uses_the_primary_session_id() {
+		let temporary = TempDir::new().expect("temporary directory should be created");
+		let rollout_segment_id = "0198cabe-0dc5-7c82-a9a9-99740a332c0e";
+		let archived = temporary.path().join("archived_sessions").join(format!(
+			"rollout-2026-07-20T10-00-00-{ARCHIVED_ID}_{rollout_segment_id}.jsonl"
+		));
+		write_rollout(&archived, ARCHIVED_ID, "Archived copy", false);
+
+		let catalog = Catalog::load(temporary.path()).expect("filesystem fallback should load");
+		let archived_threads = catalog.list(CatalogFilter {
+			archive: ArchiveFilter::Archived,
+			include_agents: false,
+		});
+
+		assert_eq!(archived_threads.len(), 1);
+		assert_eq!(archived_threads[0].id.to_string(), ARCHIVED_ID);
+		assert!(
+			catalog
+				.warnings()
+				.iter()
+				.all(|warning| !warning.contains("filename identifies"))
+		);
+	}
+
+	#[test]
+	fn compound_archive_path_resolves_from_its_primary_session_metadata() {
+		let temporary = TempDir::new().expect("temporary directory should be created");
+		let rollout_segment_id = "0198cabe-0dc5-7c82-a9a9-99740a332c0e";
+		let archived = temporary.path().join("archived_sessions").join(format!(
+			"rollout-2026-07-20T10-00-00-{ARCHIVED_ID}_{rollout_segment_id}.jsonl"
+		));
+		write_rollout(&archived, ARCHIVED_ID, "Archived copy", false);
+
+		let catalog = Catalog::load(temporary.path()).expect("filesystem fallback should load");
+		let resolved = catalog
+			.resolve(&ThreadSelector::Path(archived.clone()))
+			.expect("compound archive path should resolve");
+
+		assert_eq!(resolved.id.to_string(), ARCHIVED_ID);
+		assert_eq!(resolved.rollout_path, archived);
+		assert!(resolved.archived);
+	}
+
+	#[test]
+	fn paginated_archive_segments_share_one_catalog_identity() {
+		let temporary = TempDir::new().expect("temporary directory should be created");
+		let archived_root = temporary.path().join("archived_sessions");
+		for rollout_segment_id in [
+			"0198cabe-0dc5-7c82-a9a9-99740a332c0e",
+			"0198cabe-0dc5-7c82-a9a9-99740a332c0f",
+		] {
+			let archived = archived_root.join(format!(
+				"rollout-2026-07-20T10-00-00-{ARCHIVED_ID}_{rollout_segment_id}.jsonl"
+			));
+			write_rollout(&archived, ARCHIVED_ID, "Archived copy", false);
+		}
+
+		let catalog = Catalog::load(temporary.path()).expect("filesystem fallback should load");
+		let archived_threads = catalog.list(CatalogFilter {
+			archive: ArchiveFilter::Archived,
+			include_agents: false,
+		});
+
+		assert_eq!(archived_threads.len(), 1);
+		assert_eq!(archived_threads[0].id.to_string(), ARCHIVED_ID);
+	}
+
+	#[test]
+	fn conflicting_primary_filename_and_metadata_are_rejected() {
+		let temporary = TempDir::new().expect("temporary directory should be created");
+		let archived = rollout_path(temporary.path(), "archived_sessions", ARCHIVED_ID);
+		write_rollout(&archived, ACTIVE_ID, "Conflicting identity", false);
+
+		let catalog = Catalog::load(temporary.path()).expect("filesystem fallback should load");
+		let error = catalog
+			.resolve(&ThreadSelector::Path(archived))
+			.expect_err("conflicting identity should be rejected");
+
+		assert!(error.to_string().contains("session metadata identifies"));
+	}
+
+	#[test]
+	fn missing_database_rollout_remains_an_actionable_doctor_diagnostic() {
+		let temporary = TempDir::new().expect("temporary directory should be created");
+		let missing = rollout_path(temporary.path(), "sessions/2026/07/20", ACTIVE_ID);
+		create_catalog(
+			&temporary.path().join("state_5.sqlite"),
+			[(missing.as_path(), ACTIVE_ID, "Unavailable", false, false)],
+		);
+
+		let catalog = Catalog::load(temporary.path()).expect("catalog should load");
+
+		assert!(catalog.list(CatalogFilter::default()).is_empty());
+		assert!(catalog.warnings().iter().any(|warning| {
+			warning.contains(ACTIVE_ID) && warning.contains(&missing.display().to_string())
+		}));
 	}
 
 	fn rollout_path(home: &Path, directory: &str, id: &str) -> std::path::PathBuf {

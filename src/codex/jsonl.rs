@@ -1,19 +1,25 @@
 //! Safe, streaming parsing of Codex rollout files.
 
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
 use std::ops::ControlFlow;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
+use walkdir::WalkDir;
 
+use super::rollout::{is_rollout_file, rollout_ids_from_filename};
 use crate::domain::{Chat, ChatMessage, MessagePhase, MessageRole, ThreadId, ThreadSummary};
 
 // A cap keeps hidden tool records and compressed inputs from exhausting memory.
 const MAX_RECORD_BYTES: usize = 8 * 1024 * 1024;
+// A corrupt history chain must not cause unbounded directory traversal or reads.
+const MAX_HISTORY_SEGMENTS: usize = 256;
 
 /// Parses only messages that Codex marks as user-visible transcript events.
 ///
@@ -26,18 +32,252 @@ const MAX_RECORD_BYTES: usize = 8 * 1024 * 1024;
 pub fn parse_chat(thread: ThreadSummary) -> Result<Chat> {
 	let rollout_path = thread.rollout_path.clone();
 	let mut messages = Vec::new();
-	let warnings = visit_snapshot_records(&rollout_path, |record| {
-		if let SnapshotRecord::Message(message) = record {
-			messages.push(message);
+	let (segments, mut warnings) = resolve_rollout_chain(&rollout_path, thread.id)?;
+	let segmented = segments.len() > 1;
+	for segment in segments {
+		let mut missing_ordinal = false;
+		let segment_warnings = visit_snapshot_records(&segment.path, |record| {
+			if let SnapshotRecord::Message { ordinal, message } = record {
+				if segment
+					.end_ordinal_exclusive
+					.is_some_and(|end| ordinal.is_some_and(|ordinal| ordinal >= end))
+				{
+					return ControlFlow::Continue(());
+				}
+				missing_ordinal |= segment.end_ordinal_exclusive.is_some() && ordinal.is_none();
+				messages.push(message);
+			}
+			ControlFlow::Continue(())
+		})?;
+		if missing_ordinal {
+			warnings.push(format!(
+				"{} contains a message without an ordinal before a continuation boundary; it was retained to avoid data loss.",
+				segment_label(&segment.path)
+			));
 		}
-		ControlFlow::Continue(())
-	})?;
+		warnings.extend(segment_warnings.into_iter().map(|warning| {
+			if segmented {
+				format!("{}: {warning}", segment_label(&segment.path))
+			} else {
+				warning
+			}
+		}));
+	}
 
 	Ok(Chat {
 		thread,
 		messages,
 		warnings,
 	})
+}
+
+#[derive(Debug)]
+struct RolloutSegment {
+	path: PathBuf,
+	end_ordinal_exclusive: Option<u64>,
+}
+
+/// Follows explicit history links so abandoned roots and stale overlap stay excluded.
+fn resolve_rollout_chain(
+	head: &Path,
+	session_id: ThreadId,
+) -> Result<(Vec<RolloutSegment>, Vec<String>)> {
+	let mut reverse_chain = vec![RolloutSegment {
+		path: head.to_path_buf(),
+		end_ordinal_exclusive: None,
+	}];
+	let mut current = head.to_path_buf();
+	let mut visited = HashSet::from([current.clone()]);
+	let mut current_metadata = read_session_metadata(&current)?;
+	if current_metadata
+		.as_ref()
+		.and_then(|metadata| metadata.history_base)
+		.is_none()
+	{
+		return Ok((reverse_chain, Vec::new()));
+	}
+	let (available, ambiguous, mut warnings) = index_available_rollouts(head);
+	let mut exhausted_limit = true;
+
+	for _ in 0..MAX_HISTORY_SEGMENTS {
+		let Some(metadata) = current_metadata else {
+			exhausted_limit = false;
+			break;
+		};
+		let expected_session =
+			rollout_ids_from_filename(&current).map_or(session_id, |ids| ids.session);
+		if let Some(recorded) = metadata.id {
+			if recorded != expected_session {
+				warnings.push(format!(
+					"Stopped restoring transcript history because {} belongs to session {} instead of {}.",
+					segment_label(&current),
+					recorded,
+					expected_session
+				));
+				exhausted_limit = false;
+				break;
+			}
+		}
+		let Some(base) = metadata.history_base else {
+			exhausted_limit = false;
+			break;
+		};
+		let Some(base_path) = available.get(&base.thread_id).cloned() else {
+			warnings.push(format!(
+				"Could not restore earlier transcript segment {}; exported the available continuation only.",
+				base.thread_id
+			));
+			exhausted_limit = false;
+			break;
+		};
+		if ambiguous.contains(&base.thread_id) {
+			warnings.push(format!(
+				"Multiple rollout files identify referenced segment {}; the newest candidate was used.",
+				base.thread_id
+			));
+		}
+		if !visited.insert(base_path.clone()) {
+			warnings.push(format!(
+				"Stopped restoring transcript history after detecting a segment cycle at {}.",
+				segment_label(&base_path)
+			));
+			exhausted_limit = false;
+			break;
+		}
+		let base_metadata = read_session_metadata(&base_path)?;
+		if let (Some(metadata), Some(ids)) = (
+			base_metadata.as_ref(),
+			rollout_ids_from_filename(&base_path),
+		) {
+			if metadata.id.is_some_and(|recorded| recorded != ids.session) {
+				warnings.push(format!(
+					"Ignored transcript history segment {} because its filename and metadata identify different sessions.",
+					segment_label(&base_path)
+				));
+				exhausted_limit = false;
+				break;
+			}
+		}
+		reverse_chain.push(RolloutSegment {
+			path: base_path.clone(),
+			end_ordinal_exclusive: Some(base.end_ordinal_exclusive),
+		});
+		current = base_path;
+		current_metadata = base_metadata;
+	}
+
+	if exhausted_limit {
+		warnings.push(format!(
+			"Stopped restoring transcript history after {MAX_HISTORY_SEGMENTS} segments."
+		));
+	}
+	reverse_chain.reverse();
+	Ok((reverse_chain, warnings))
+}
+
+/// Indexes physical segments in the local Codex roots; explicit links choose the branch.
+fn index_available_rollouts(
+	head: &Path,
+) -> (HashMap<ThreadId, PathBuf>, HashSet<ThreadId>, Vec<String>) {
+	let mut by_segment: HashMap<ThreadId, (SystemTime, PathBuf)> = HashMap::new();
+	let mut ambiguous = HashSet::new();
+	let mut warnings = Vec::new();
+	for entry in rollout_search_entries(head) {
+		let entry = match entry {
+			Ok(entry) => entry,
+			Err(error) => {
+				warnings.push(format!(
+					"Could not inspect one potential transcript segment: {error}"
+				));
+				continue;
+			}
+		};
+		if !entry.file_type().is_file() || !is_rollout_file(entry.path()) {
+			continue;
+		}
+		let Some(ids) = rollout_ids_from_filename(entry.path()) else {
+			continue;
+		};
+		let modified = entry
+			.metadata()
+			.ok()
+			.and_then(|metadata| metadata.modified().ok())
+			.unwrap_or(SystemTime::UNIX_EPOCH);
+		let candidate = (modified, entry.into_path());
+		match by_segment.get_mut(&ids.segment) {
+			Some(existing) => {
+				ambiguous.insert(ids.segment);
+				if existing.0 < candidate.0
+					|| (existing.0 == candidate.0 && existing.1 < candidate.1)
+				{
+					*existing = candidate;
+				}
+			}
+			None => {
+				by_segment.insert(ids.segment, candidate);
+			}
+		}
+	}
+
+	(
+		by_segment
+			.into_iter()
+			.map(|(segment, (_, path))| (segment, path))
+			.collect(),
+		ambiguous,
+		warnings,
+	)
+}
+
+fn rollout_search_entries(
+	head: &Path,
+) -> Box<dyn Iterator<Item = walkdir::Result<walkdir::DirEntry>>> {
+	if let Some(home) = codex_home_from_rollout(head) {
+		let entries = [home.join("sessions"), home.join("archived_sessions")]
+			.into_iter()
+			.filter(|root| root.is_dir())
+			.flat_map(|root| WalkDir::new(root).follow_links(false).into_iter());
+		Box::new(entries)
+	} else if let Some(parent) = head.parent() {
+		Box::new(
+			WalkDir::new(parent)
+				.max_depth(1)
+				.follow_links(false)
+				.into_iter(),
+		)
+	} else {
+		Box::new(std::iter::empty())
+	}
+}
+
+fn codex_home_from_rollout(path: &Path) -> Option<&Path> {
+	path.ancestors().find_map(|ancestor| {
+		let name = ancestor.file_name()?.to_str()?;
+		matches!(name, "sessions" | "archived_sessions").then(|| ancestor.parent())?
+	})
+}
+
+fn read_session_metadata(path: &Path) -> Result<Option<SessionMetadata>> {
+	let mut metadata = None;
+	visit_snapshot_records(path, |record| {
+		if let SnapshotRecord::Session {
+			metadata: session, ..
+		} = record
+		{
+			metadata = Some(session);
+			ControlFlow::Break(())
+		} else {
+			ControlFlow::Continue(())
+		}
+	})?;
+	Ok(metadata)
+}
+
+fn segment_label(path: &Path) -> String {
+	path.file_name()
+		.and_then(|name| name.to_str())
+		.unwrap_or("rollout")
+		.to_owned()
 }
 
 /// Metadata needed to recover a catalog entry when `SQLite` is unavailable.
@@ -49,13 +289,26 @@ pub(crate) struct SessionMetadata {
 	pub(crate) is_agent: bool,
 	pub(crate) history_mode: Option<String>,
 	pub(crate) model: Option<String>,
+	pub(crate) history_base: Option<HistoryBase>,
+}
+
+/// Link from one physical continuation segment to the preceding rollout prefix.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HistoryBase {
+	pub(crate) thread_id: ThreadId,
+	pub(crate) end_ordinal_exclusive: u64,
 }
 
 /// Relevant rollout records are normalized before other storage code sees them.
 #[derive(Debug, Clone)]
 pub(crate) enum SnapshotRecord {
-	Session(SessionMetadata),
-	Message(ChatMessage),
+	Session {
+		metadata: SessionMetadata,
+	},
+	Message {
+		ordinal: Option<u64>,
+		message: ChatMessage,
+	},
 }
 
 /// Streams relevant records while discarding hidden response items and new types.
@@ -183,9 +436,14 @@ fn read_bounded_line(
 fn parse_relevant_record(line: &[u8]) -> serde_json::Result<Option<SnapshotRecord>> {
 	let header = serde_json::from_slice::<RecordHeader>(line)?;
 	match header.kind.as_deref() {
-		Some("event_msg") => parse_event_record(line),
+		Some("event_msg") => parse_event_record(line).map(|record| {
+			record.map(|message| SnapshotRecord::Message {
+				ordinal: header.ordinal,
+				message,
+			})
+		}),
 		Some("session_meta") => {
-			parse_session_record(line).map(|record| Some(SnapshotRecord::Session(record)))
+			parse_session_record(line).map(|metadata| Some(SnapshotRecord::Session { metadata }))
 		}
 		// `response_item` contains hidden context and duplicates, so it is never rendered.
 		_ => Ok(None),
@@ -193,44 +451,107 @@ fn parse_relevant_record(line: &[u8]) -> serde_json::Result<Option<SnapshotRecor
 }
 
 /// Converts the two explicitly visible event variants into renderer-safe messages.
-fn parse_event_record(line: &[u8]) -> serde_json::Result<Option<SnapshotRecord>> {
+fn parse_event_record(line: &[u8]) -> serde_json::Result<Option<ChatMessage>> {
 	let envelope = serde_json::from_slice::<EventEnvelope>(line)?;
-	let had_message = envelope.payload.message.is_some();
-	let attachment_count = value_count(envelope.payload.images.as_ref())
-		+ value_count(envelope.payload.local_images.as_ref());
-	if !had_message && attachment_count == 0 {
-		return Ok(None);
-	}
 	let timestamp = envelope.timestamp.as_deref().and_then(parse_timestamp);
-	let mut text = envelope
-		.payload
+	let normalized = match envelope.payload.kind.as_str() {
+		"user_message" | "agent_message" => normalize_legacy_event(&envelope.payload, timestamp),
+		"item_completed" => envelope
+			.payload
+			.item
+			.as_ref()
+			.and_then(|item| normalize_completed_item(item, timestamp)),
+		_ => None,
+	};
+
+	Ok(normalized)
+}
+
+/// Normalizes the original flat event shape used by earlier Codex releases.
+fn normalize_legacy_event(
+	payload: &EventPayload,
+	timestamp: Option<DateTime<Utc>>,
+) -> Option<ChatMessage> {
+	let had_message = payload.message.is_some();
+	let attachment_count =
+		value_count(payload.images.as_ref()) + value_count(payload.local_images.as_ref());
+	if !had_message && attachment_count == 0 {
+		return None;
+	}
+
+	let mut text = payload
 		.message
 		.as_deref()
 		.map(sanitize_text)
 		.unwrap_or_default();
 	append_attachment_note(&mut text, attachment_count);
-
-	let normalized = match envelope.payload.kind.as_str() {
-		"user_message" => ChatMessage {
+	match payload.kind.as_str() {
+		"user_message" => Some(ChatMessage {
 			role: MessageRole::User,
 			phase: MessagePhase::User,
 			text,
 			timestamp,
-		},
-		"agent_message" => ChatMessage {
+		}),
+		"agent_message" => Some(ChatMessage {
 			role: MessageRole::Assistant,
-			phase: match envelope.payload.phase.as_deref() {
-				Some("commentary") => MessagePhase::Commentary,
-				Some("final_answer") => MessagePhase::FinalAnswer,
-				_ => MessagePhase::Legacy,
-			},
+			phase: message_phase(payload.phase.as_deref()),
 			text,
 			timestamp,
-		},
-		_ => return Ok(None),
-	};
+		}),
+		_ => None,
+	}
+}
 
-	Ok(Some(SnapshotRecord::Message(normalized)))
+/// Normalizes the completed-item event shape emitted by current Codex clients.
+fn normalize_completed_item(
+	item: &CompletedItem,
+	timestamp: Option<DateTime<Utc>>,
+) -> Option<ChatMessage> {
+	let mut text = item
+		.content
+		.iter()
+		.filter(|content| content.kind.eq_ignore_ascii_case("text"))
+		.filter_map(|content| content.text.as_deref())
+		.map(sanitize_text)
+		.filter(|text| !text.is_empty())
+		.collect::<Vec<_>>()
+		.join("\n\n");
+	let attachment_count = item
+		.content
+		.iter()
+		.filter(|content| {
+			content.kind.eq_ignore_ascii_case("image")
+				|| content.kind.eq_ignore_ascii_case("local_image")
+		})
+		.count();
+	append_attachment_note(&mut text, attachment_count);
+	if text.is_empty() {
+		return None;
+	}
+
+	match item.kind.as_str() {
+		"UserMessage" => Some(ChatMessage {
+			role: MessageRole::User,
+			phase: MessagePhase::User,
+			text,
+			timestamp,
+		}),
+		"AgentMessage" => Some(ChatMessage {
+			role: MessageRole::Assistant,
+			phase: message_phase(item.phase.as_deref()),
+			text,
+			timestamp,
+		}),
+		_ => None,
+	}
+}
+
+fn message_phase(phase: Option<&str>) -> MessagePhase {
+	match phase {
+		Some("commentary") => MessagePhase::Commentary,
+		Some("final_answer") => MessagePhase::FinalAnswer,
+		_ => MessagePhase::Legacy,
+	}
 }
 
 fn value_count(value: Option<&Value>) -> usize {
@@ -278,6 +599,7 @@ fn parse_session_record(line: &[u8]) -> serde_json::Result<SessionMetadata> {
 			.payload
 			.id
 			.as_deref()
+			.or(envelope.payload.session_id.as_deref())
 			.and_then(|id| id.parse::<ThreadId>().ok()),
 		cwd: envelope.payload.cwd.map(|cwd| sanitize_text(&cwd)),
 		timestamp: envelope.timestamp.as_deref().and_then(parse_timestamp),
@@ -287,6 +609,10 @@ fn parse_session_record(line: &[u8]) -> serde_json::Result<SessionMetadata> {
 			.history_mode
 			.map(|mode| sanitize_text(&mode)),
 		model: envelope.payload.model.map(|model| sanitize_text(&model)),
+		history_base: envelope.payload.history_base.map(|base| HistoryBase {
+			thread_id: base.thread_id,
+			end_ordinal_exclusive: base.end_ordinal_exclusive,
+		}),
 	})
 }
 
@@ -338,6 +664,7 @@ fn is_zstd_path(path: &Path) -> bool {
 struct RecordHeader {
 	#[serde(rename = "type")]
 	kind: Option<String>,
+	ordinal: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -354,6 +681,24 @@ struct EventPayload {
 	phase: Option<String>,
 	images: Option<Value>,
 	local_images: Option<Value>,
+	item: Option<CompletedItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompletedItem {
+	#[serde(rename = "type")]
+	kind: String,
+	#[serde(default)]
+	content: Vec<CompletedContent>,
+	phase: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompletedContent {
+	#[serde(rename = "type")]
+	#[serde(default)]
+	kind: String,
+	text: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -365,11 +710,19 @@ struct SessionEnvelope {
 #[derive(Debug, Deserialize)]
 struct SessionPayload {
 	id: Option<String>,
+	session_id: Option<String>,
 	cwd: Option<String>,
 	source: Option<Value>,
 	agent_path: Option<String>,
 	history_mode: Option<String>,
 	model: Option<String>,
+	history_base: Option<HistoryBasePayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HistoryBasePayload {
+	thread_id: ThreadId,
+	end_ordinal_exclusive: u64,
 }
 
 #[cfg(test)]
@@ -409,6 +762,201 @@ mod tests {
 			Utc.with_ymd_and_hms(2026, 7, 20, 10, 0, 3).single(),
 		);
 		assert!(chat.warnings.is_empty());
+	}
+
+	#[test]
+	fn renders_current_completed_items_without_exposing_hidden_response_records() {
+		let temporary = TempDir::new().expect("temporary directory should be created");
+		let path = temporary.path().join("rollout.jsonl");
+		let records = concat!(
+			"{\"ordinal\":1,\"timestamp\":\"2026-09-18T10:00:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"item_completed\",\"item\":{\"type\":\"UserMessage\",\"content\":[{\"type\":\"text\",\"text\":\"Current prompt\"},{\"type\":\"image\",\"image_url\":\"data:image/png;base64,PRIVATE\"}]}}}\n",
+			"{\"ordinal\":2,\"timestamp\":\"2026-09-18T10:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"content\":[{\"text\":\"hidden duplicate\"}]}}\n",
+			"{\"ordinal\":2,\"timestamp\":\"2026-09-18T10:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"item_completed\",\"item\":{\"type\":\"ToolCall\",\"content\":[{\"type\":\"text\",\"text\":\"hidden tool arguments\"}]}}}\n",
+			"{\"ordinal\":2,\"timestamp\":\"2026-09-18T10:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"item_completed\",\"item\":{\"type\":\"Reasoning\",\"content\":[{\"type\":\"text\",\"text\":\"hidden reasoning\"}]}}}\n",
+			"{\"ordinal\":3,\"timestamp\":\"2026-09-18T10:00:02Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"item_completed\",\"item\":{\"type\":\"AgentMessage\",\"phase\":\"final_answer\",\"content\":[{\"type\":\"Text\",\"text\":\"Current answer\"}]}}}\n",
+		);
+		fs::write(&path, records).expect("rollout fixture should be written");
+
+		let chat = parse_chat(summary(path)).expect("current rollout should parse");
+
+		assert_eq!(chat.messages.len(), 2);
+		assert_eq!(chat.messages[0].role, MessageRole::User);
+		assert!(chat.messages[0].text.contains("Current prompt"));
+		assert!(chat.messages[0].text.contains("1 image attachment"));
+		assert!(!chat.messages[0].text.contains("PRIVATE"));
+		assert_eq!(chat.messages[1].text, "Current answer");
+		assert_eq!(chat.messages[1].phase, MessagePhase::FinalAnswer);
+		assert!(
+			chat.messages
+				.iter()
+				.all(|message| !message.text.contains("hidden tool arguments")
+					&& !message.text.contains("hidden reasoning"))
+		);
+	}
+
+	#[test]
+	fn continuation_segments_restore_history_without_replaying_overlap() {
+		let temporary = TempDir::new().expect("temporary directory should be created");
+		let archived = temporary.path().join("archived_sessions");
+		fs::create_dir_all(&archived).expect("archive directory should be created");
+		let base_segment = "0198cabe-0dc5-7c82-a9a9-99740a332c0c";
+		let current_segment = "0198cabe-0dc5-7c82-a9a9-99740a332c0d";
+		let base = archived.join(format!(
+			"rollout-2026-09-18T10-00-00-{ID}_{base_segment}.jsonl"
+		));
+		let current = archived.join(format!(
+			"rollout-2026-09-18T11-00-00-{ID}_{current_segment}.jsonl"
+		));
+		let abandoned = archived.join(format!("rollout-2026-09-18T09-00-00-{ID}.jsonl"));
+		fs::write(
+			&abandoned,
+			format!(
+				"{{\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"{ID}\"}}}}\n\
+				 {{\"ordinal\":1,\"type\":\"event_msg\",\"payload\":{{\"type\":\"user_message\",\"message\":\"Abandoned root\"}}}}\n"
+			),
+		)
+		.expect("abandoned rollout should be written");
+		fs::write(
+			&base,
+			format!(
+				"{{\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"{ID}\"}}}}\n\
+				 {{\"ordinal\":1,\"type\":\"event_msg\",\"payload\":{{\"type\":\"user_message\",\"message\":\"From the base\"}}}}\n\
+				 {{\"ordinal\":2,\"type\":\"event_msg\",\"payload\":{{\"type\":\"agent_message\",\"message\":\"Discarded overlap\"}}}}\n"
+			),
+		)
+		.expect("base rollout should be written");
+		fs::write(
+			&current,
+			format!(
+				"{{\"ordinal\":2,\"type\":\"session_meta\",\"payload\":{{\"id\":\"{ID}\",\"history_base\":{{\"thread_id\":\"{base_segment}\",\"end_ordinal_exclusive\":2}}}}}}\n\
+				 {{\"ordinal\":3,\"type\":\"event_msg\",\"payload\":{{\"type\":\"agent_message\",\"message\":\"From the continuation\",\"phase\":\"final_answer\"}}}}\n"
+			),
+		)
+		.expect("continuation rollout should be written");
+
+		let chat = parse_chat(summary(current)).expect("segmented rollout should parse");
+
+		assert_eq!(
+			chat.messages
+				.iter()
+				.map(|message| message.text.as_str())
+				.collect::<Vec<_>>(),
+			["From the base", "From the continuation"]
+		);
+		assert!(
+			chat.messages
+				.iter()
+				.all(|message| message.text != "Abandoned root")
+		);
+	}
+
+	#[test]
+	fn history_links_cross_storage_roots_and_canonical_session_ids() {
+		let temporary = TempDir::new().expect("temporary directory should be created");
+		let predecessor_id = "0198cabe-0dc5-7c82-a9a9-99740a332c20";
+		let active = temporary.path().join("sessions/2026/09/18");
+		let archived = temporary.path().join("archived_sessions");
+		fs::create_dir_all(&active).expect("active directory should be created");
+		fs::create_dir_all(&archived).expect("archive directory should be created");
+		let predecessor = active.join(format!(
+			"rollout-2026-09-18T10-00-00-{predecessor_id}.jsonl.zst"
+		));
+		let head = archived.join(format!("rollout-2026-09-18T11-00-00-{ID}.jsonl"));
+		let predecessor_records = format!(
+			"{{\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"{predecessor_id}\"}}}}\n\
+			 {{\"ordinal\":1,\"type\":\"event_msg\",\"payload\":{{\"type\":\"user_message\",\"message\":\"From another session root\"}}}}\n"
+		);
+		let compressed = zstd::stream::encode_all(predecessor_records.as_bytes(), 0)
+			.expect("predecessor rollout should compress");
+		fs::write(&predecessor, compressed).expect("predecessor rollout should be written");
+		fs::write(
+			&head,
+			format!(
+				"{{\"ordinal\":2,\"type\":\"session_meta\",\"payload\":{{\"id\":\"{ID}\",\"history_base\":{{\"thread_id\":\"{predecessor_id}\",\"end_ordinal_exclusive\":2}}}}}}\n\
+				 {{\"ordinal\":3,\"type\":\"event_msg\",\"payload\":{{\"type\":\"agent_message\",\"message\":\"From the archived head\"}}}}\n"
+			),
+		)
+		.expect("archived head should be written");
+
+		let chat = parse_chat(summary(head)).expect("cross-root history should parse");
+
+		assert_eq!(
+			chat.messages
+				.iter()
+				.map(|message| message.text.as_str())
+				.collect::<Vec<_>>(),
+			["From another session root", "From the archived head"]
+		);
+	}
+
+	#[test]
+	fn missing_history_segment_is_reported_without_losing_the_available_head() {
+		let temporary = TempDir::new().expect("temporary directory should be created");
+		let missing_segment = "0198cabe-0dc5-7c82-a9a9-99740a332c30";
+		let path = temporary
+			.path()
+			.join(format!("rollout-2026-09-18T11-00-00-{ID}.jsonl"));
+		fs::write(
+			&path,
+			format!(
+				"{{\"ordinal\":2,\"type\":\"session_meta\",\"payload\":{{\"id\":\"{ID}\",\"history_base\":{{\"thread_id\":\"{missing_segment}\",\"end_ordinal_exclusive\":2}}}}}}\n\
+				 {{\"ordinal\":3,\"type\":\"event_msg\",\"payload\":{{\"type\":\"agent_message\",\"message\":\"Available head\"}}}}\n"
+			),
+		)
+		.expect("head rollout should be written");
+
+		let chat = parse_chat(summary(path)).expect("available head should still parse");
+
+		assert_eq!(chat.messages[0].text, "Available head");
+		assert!(
+			chat.warnings
+				.iter()
+				.any(|warning| warning.contains(missing_segment))
+		);
+	}
+
+	#[test]
+	fn cyclic_history_links_stop_without_replaying_segments() {
+		let temporary = TempDir::new().expect("temporary directory should be created");
+		let base_segment = "0198cabe-0dc5-7c82-a9a9-99740a332c40";
+		let head_segment = "0198cabe-0dc5-7c82-a9a9-99740a332c41";
+		let base = temporary.path().join(format!(
+			"rollout-2026-09-18T10-00-00-{ID}_{base_segment}.jsonl"
+		));
+		let head = temporary.path().join(format!(
+			"rollout-2026-09-18T11-00-00-{ID}_{head_segment}.jsonl"
+		));
+		fs::write(
+			&base,
+			format!(
+				"{{\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"{ID}\",\"history_base\":{{\"thread_id\":\"{head_segment}\",\"end_ordinal_exclusive\":4}}}}}}\n\
+				 {{\"ordinal\":1,\"type\":\"event_msg\",\"payload\":{{\"type\":\"user_message\",\"message\":\"From the base\"}}}}\n"
+			),
+		)
+		.expect("base rollout should be written");
+		fs::write(
+			&head,
+			format!(
+				"{{\"ordinal\":2,\"type\":\"session_meta\",\"payload\":{{\"id\":\"{ID}\",\"history_base\":{{\"thread_id\":\"{base_segment}\",\"end_ordinal_exclusive\":2}}}}}}\n\
+				 {{\"ordinal\":3,\"type\":\"event_msg\",\"payload\":{{\"type\":\"agent_message\",\"message\":\"From the head\"}}}}\n"
+			),
+		)
+		.expect("head rollout should be written");
+
+		let chat = parse_chat(summary(head)).expect("cyclic history should stop safely");
+
+		assert_eq!(
+			chat.messages
+				.iter()
+				.map(|message| message.text.as_str())
+				.collect::<Vec<_>>(),
+			["From the base", "From the head"]
+		);
+		assert!(
+			chat.warnings
+				.iter()
+				.any(|warning| warning.contains("segment cycle"))
+		);
 	}
 
 	#[test]
@@ -491,6 +1039,24 @@ mod tests {
 		assert_eq!(chat.messages[0].role, MessageRole::User);
 		assert!(chat.messages[0].text.contains("3 image attachments"));
 		assert!(!chat.messages[0].text.contains("/private/image.png"));
+	}
+
+	#[test]
+	fn current_local_image_only_prompts_keep_a_private_attachment_marker() {
+		let temporary = TempDir::new().expect("temporary directory should be created");
+		let path = temporary.path().join("rollout.jsonl");
+		fs::write(
+			&path,
+			"{\"type\":\"event_msg\",\"payload\":{\"type\":\"item_completed\",\"item\":{\"type\":\"UserMessage\",\"content\":[{\"type\":\"local_image\",\"path\":\"/private/current-image.png\"}]}}}\n",
+		)
+		.expect("current attachment rollout fixture should be written");
+
+		let chat = parse_chat(summary(path)).expect("current image-only prompt should parse");
+
+		assert_eq!(chat.messages.len(), 1);
+		assert_eq!(chat.messages[0].role, MessageRole::User);
+		assert!(chat.messages[0].text.contains("1 image attachment"));
+		assert!(!chat.messages[0].text.contains("/private/current-image.png"));
 	}
 
 	#[test]

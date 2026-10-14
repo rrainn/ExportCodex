@@ -94,7 +94,6 @@ fn browse_and_export(
 
 	let home = resolve_codex_home(home_override)?;
 	let catalog = Catalog::load(home)?;
-	print_catalog_warnings(&catalog);
 	let threads = catalog.list(CatalogFilter {
 		archive: ArchiveFilter::All,
 		include_agents: true,
@@ -125,7 +124,6 @@ fn export_selected(
 ) -> Result<()> {
 	let home = resolve_codex_home(home_override)?;
 	let catalog = Catalog::load(home)?;
-	print_catalog_warnings(&catalog);
 	let selector = ThreadSelector::from_str(selector).context("invalid thread selector")?;
 	let thread = catalog.resolve(&selector)?;
 	export_thread(thread, file, args, quiet)
@@ -166,7 +164,6 @@ fn export_thread(
 fn list_threads(home_override: Option<&Path>, args: &ListArgs) -> Result<()> {
 	let home = resolve_codex_home(home_override)?;
 	let catalog = Catalog::load(home)?;
-	print_catalog_warnings(&catalog);
 	let archive = if args.archived {
 		ArchiveFilter::Archived
 	} else {
@@ -304,6 +301,8 @@ fn verify_pdf_renderer() -> Result<()> {
 }
 
 fn print_catalog_warnings(catalog: &Catalog) {
+	// Global catalog drift is diagnostic noise during an otherwise valid export.
+	// `doctor` keeps those details available without cluttering normal workflows.
 	for warning in catalog.warnings() {
 		eprintln!("warning: {warning}");
 	}

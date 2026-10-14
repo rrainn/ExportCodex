@@ -3,6 +3,7 @@
 pub mod catalog;
 pub mod home;
 pub mod jsonl;
+mod rollout;
 pub mod selector;
 
 pub use catalog::{ArchiveFilter, Catalog, CatalogFilter};

@@ -12,6 +12,9 @@ use crate::domain::{Chat, RenderOptions, ThemeName};
 use super::markdown;
 use super::theme::{accent, font_size, margin_mm, palette, paper_pdf, title};
 
+// This conservative cap fits one-em glyphs on A4 with the widest supported margins.
+const RUNNING_HEADER_MAX_CHARACTERS: usize = 48;
+
 /// A failure while preparing or generating a PDF document.
 #[derive(Debug)]
 pub enum PdfRenderError {
@@ -76,6 +79,10 @@ fn configuration(chat: &Chat, options: &RenderOptions, asset_root: &std::path::P
 	let page_size = paper_pdf(options.paper_size);
 	let document_title = title(chat, options);
 	let title = toml_string(&document_title);
+	let header_title = toml_string(&running_header(
+		&document_title,
+		RUNNING_HEADER_MAX_CHARACTERS,
+	));
 	let image_root = toml_string(&asset_root.to_string_lossy());
 	let link_underline = matches!(options.theme, ThemeName::Mono);
 
@@ -185,7 +192,7 @@ keywords = ["Codex", "chat", "export"]
 creator = "ExportCodex"
 
 [header]
-left = "{{title}}"
+left = {header_title}
 show_on_first_page = false
 gap_pt = 12.0
 
@@ -222,6 +229,17 @@ allow_remote_images = false
 
 fn toml_string(value: &str) -> String {
 	toml::Value::String(value.to_owned()).to_string()
+}
+
+/// Keeps a running header inside the printable width while preserving full metadata.
+fn running_header(value: &str, maximum_characters: usize) -> String {
+	if value.chars().count() <= maximum_characters {
+		return value.to_owned();
+	}
+	let content_length = maximum_characters.saturating_sub(3);
+	let mut shortened = value.chars().take(content_length).collect::<String>();
+	shortened.push_str("...");
+	shortened
 }
 
 #[cfg(test)]
@@ -276,6 +294,39 @@ mod tests {
 		assert!(config.contains("allow_remote_images = false"));
 		assert!(config.contains("allow_absolute_image_paths = false"));
 		assert!(config.contains("right = \"{page} / {total_pages}\""));
+	}
+
+	#[test]
+	fn running_header_shortens_long_titles_without_changing_document_metadata() {
+		let mut chat = sample_chat();
+		chat.thread.title = "A very long task title with a URL https://example.com/a/path/that/would/otherwise/run/past/the/printable/page".to_owned();
+		let config = configuration(
+			&chat,
+			&RenderOptions::default(),
+			std::path::Path::new("/tmp/empty"),
+		);
+		let metadata_title = section_string(&config, "metadata", "title");
+		let header_title = section_string(&config, "header", "left");
+
+		assert_eq!(metadata_title, chat.thread.title);
+		assert!(header_title.chars().count() <= RUNNING_HEADER_MAX_CHARACTERS);
+		assert!(header_title.ends_with("..."));
+	}
+
+	fn section_string(config: &str, section: &str, key: &str) -> String {
+		let section = config
+			.split_once(&format!("[{section}]\n"))
+			.expect("configuration section should exist")
+			.1;
+		let line = section
+			.lines()
+			.find(|line| line.starts_with(&format!("{key} = ")))
+			.expect("configuration key should exist");
+		line.split_once(" = ")
+			.expect("configuration value should exist")
+			.1
+			.trim_matches('"')
+			.to_owned()
 	}
 
 	#[test]

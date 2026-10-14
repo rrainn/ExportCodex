@@ -188,7 +188,9 @@ The data directory resolves in this order:
 
 ExportCodex opens the root Codex state catalog read-only and falls back to scanning `sessions` and `archived_sessions` rollout files when needed. It understands both `.jsonl` and `.jsonl.zst` histories and takes a bounded snapshot when a task is still being written.
 
-Only user-visible `user_message` and `agent_message` events enter the normal transcript. Codex rollout files also contain model-facing developer instructions, environment context, and duplicated response records; ExportCodex intentionally does not render those records. This both avoids duplicates and prevents hidden context from leaking into a shared export. Image attachments are represented by a count-only placeholder so image-only prompts are not silently lost, while local paths and image data are never copied into the document.
+Archived filenames may contain a second UUID for a rollout continuation segment. ExportCodex uses the first UUID and rollout metadata as the canonical session identity, shows the chat once in the browser, and follows Codex's explicit history links to restore earlier segments without replaying stale overlap. Unrelated stale catalog rows do not clutter successful exports; run `export-codex doctor` to inspect storage diagnostics.
+
+Only user-visible message events enter the normal transcript, including legacy `user_message` / `agent_message` records and current completed `UserMessage` / `AgentMessage` items. Codex rollout files also contain model-facing developer instructions, environment context, tool activity, reasoning, and duplicated response records; ExportCodex intentionally does not render those records. This both avoids duplicates and prevents hidden context from leaking into a shared export. Image attachments are represented by a count-only placeholder so image-only prompts are not silently lost, while local paths and image data are never copied into the document.
 
 Message bodies and catalog strings are treated as untrusted input. Raw HTML is escaped, unsafe link schemes are neutralized, terminal control characters are stripped, remote assets are not fetched, and malformed trailing records produce a warning rather than corrupting an otherwise usable export. Records larger than 8 MiB are skipped with a warning so hidden tool output and compressed inputs cannot cause unbounded per-record memory use.
 
@@ -201,7 +203,7 @@ cargo test --workspace --all-features --locked
 cargo doc --workspace --all-features --no-deps --locked
 ```
 
-The test suite covers selector parsing, active and archived discovery, schema fallbacks, bounded JSONL parsing, hidden-context exclusion, attachment placeholders, terminal filtering, output collision protection, Markdown boundary safety, HTML safety, selectable PDF generation, and CLI behavior. GitHub Actions runs formatting, linting, documentation, and tests across Linux, macOS, and Windows. A separate release workflow builds and smoke-tests all four Homebrew platforms before publishing.
+The test suite covers selector parsing, active and archived discovery, current and legacy message schemas, linked continuation histories, bounded JSONL parsing, hidden-context exclusion, attachment placeholders, terminal filtering, output collision protection, Markdown boundary safety, HTML safety, selectable PDF generation, and CLI behavior. GitHub Actions runs formatting, linting, documentation, and tests across Linux, macOS, and Windows. A separate release workflow builds and smoke-tests all four Homebrew platforms before publishing.
 
 See [RELEASING.md](RELEASING.md) for release and tap administration, and [CHANGELOG.md](CHANGELOG.md) for user-facing changes.
 
