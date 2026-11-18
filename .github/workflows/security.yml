@@ -20,7 +20,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Check out source
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@v7.0.1
 
       - name: Audit RustSec advisories
         uses: rustsec/audit-check@v2.0.0
