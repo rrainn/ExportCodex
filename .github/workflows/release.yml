@@ -36,7 +36,7 @@ jobs:
       version: ${{ steps.release.outputs.version }}
     steps:
       - name: Check out release tag
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
           ref: ${{ env.RELEASE_TAG }}
@@ -82,7 +82,7 @@ jobs:
     timeout-minutes: 35
     steps:
       - name: Check out release tag
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@v7.0.1
         with:
           ref: ${{ needs.metadata.outputs.tag }}
 
@@ -128,7 +128,7 @@ jobs:
             target: x86_64-unknown-linux-musl
     steps:
       - name: Check out release tag
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@v7.0.1
         with:
           ref: ${{ needs.metadata.outputs.tag }}
 
@@ -156,7 +156,7 @@ jobs:
         run: target/${{ matrix.target }}/release/export-codex --version
 
       - name: Upload unmodified binary
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: binary-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/export-codex
@@ -172,13 +172,13 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Check out release tag
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
           ref: ${{ needs.metadata.outputs.tag }}
 
       - name: Download platform binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: binary-*
           path: binaries
@@ -255,7 +255,7 @@ jobs:
           ruby -c release-assets/Formula/export-codex.rb
 
       - name: Upload release assets
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: release-assets
           path: release-assets/
@@ -289,12 +289,12 @@ jobs:
       HOMEBREW_NO_SANDBOX_LINUX: 1
     steps:
       - name: Check out release tag
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@v7.0.1
         with:
           ref: ${{ needs.metadata.outputs.tag }}
 
       - name: Download release assets
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: release-assets
           path: release-assets
@@ -363,7 +363,7 @@ jobs:
       url: ${{ steps.publish.outputs.url }}
     steps:
       - name: Download release assets
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: release-assets
           path: release-assets
@@ -417,7 +417,7 @@ jobs:
     environment: release
     steps:
       - name: Download rendered formula
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: release-assets
           path: release-assets
